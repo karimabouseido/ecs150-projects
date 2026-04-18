@@ -52,13 +52,14 @@ bool builtinCommand(const parsed& pcommand, vector<string>& path) {
     }
 
     if (cmdName == "cd") {
-        if (pcommand.args.size() > 1) { //cd should have only 1 argument
+        if (pcommand.args.size() != 2) { //cd should have only 1 argument
             print_error();
             return true;
         }
         if (chdir(pcommand.args[1].c_str()) != 0) { //change directory
             print_error(); //if it's not 0, then chdir failed
         }
+        return true;
     }
 
     if (cmdName == "path") {
@@ -108,6 +109,41 @@ void PathCommand(const parsed& pcommand, const vector<string> &path, vector<pid_
         return;
     }
 
+    if (pid == 0) {  //child process executes command
+        if (pcommand.redirect) {
+            //file descriptor for output file, write permissions
+            int fd = open(pcommand.outFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (fd < 0) { //if file fails to open, print error
+                print_error();
+                _exit(1); //exit child process safely
+            }
+            if (dup2(fd, STDOUT_FILENO) < 0) { //redirect stdout to output file
+                print_error();
+                close(fd);
+                _exit(1);
+            }
+            if (dup2(fd, STDERR_FILENO) < 0) { //redirect stderr to output file
+                print_error();
+                close(fd);
+                _exit(1);
+            }
+            close(fd); //close file descriptor
+        }
+
+        //SETUP SO EXECV works and COMMANDS GET EXECUTED
+        vector <char*> argVec; //create argument vector for execv (execute file with argument vector)
+        argVec.reserve(pcommand.args.size() + 1); //reserve space for command arguments
+        for (const string& arg : pcommand.args) { //iterate through string command arguments
+            argVec.push_back(const_cast<char*>(arg.c_str())); //convert to char and push into argVec
+        }
+        argVec.push_back(nullptr); //argVec must end with null pointer
+
+        execv(execPath.c_str(), argVec.data()); //execute command, replacing child process
+        print_error(); //if execv fails, goes here and prints error
+        _exit(1);
+    }
+
+    child_pid.push_back(pid); //parent process stores child PID for waiting later
 }
 
 vector<string> splitChunk(const string &s) {
@@ -235,6 +271,11 @@ int main(int argc, char *argv[]) {
 
         //PARALLEL COMMAND SPLIT AND SYNTAX CHECK
         vector<string> commandChunks = ParallelCommandSplit(trimmedLine); //split line into parallel command chunks by "&"
+
+        // allow a trailing '&' by ignoring the final empty chunk
+        if (!commandChunks.empty() && wspaceTrim(commandChunks.back()).empty()) {
+            commandChunks.pop_back();
+        }
         
         bool chunksPresent = false; //checks if at least one command exists after ParallelCommandSplit
         bool syntaxCheck = true; //checks for syntax error
