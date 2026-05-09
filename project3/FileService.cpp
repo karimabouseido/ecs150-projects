@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/stat.h>
 
 #include <iostream>
 #include <map>
@@ -24,7 +25,6 @@ FileService::FileService(string basedir) : HttpService("/") {
   }
 
   this->m_basedir = basedir;
-  this->m_last_error = 0;
 }
 
 FileService::~FileService(){}
@@ -43,15 +43,22 @@ void FileService::get(HTTPRequest *request, HTTPResponse *response) {
       return;
     }
 
+  // Check if file exists and is readable using stat()
+  struct stat st;
+  if (stat(path.c_str(), &st) < 0) {
+    // File access failed - check what error occurred
+    if (errno == ENOENT) {
+      response->setStatus(404); // Not found
+    } else {
+      response->setStatus(403); // Forbidden (permission denied or other error)
+    }
+    return;
+  }
+
   string fileContents = this->readFile(path);
 
   if (fileContents.size() == 0) {
-    // Distinguish between 404 (not found) and 403 (forbidden)
-    if (m_last_error == ENOENT) {
-      response->setStatus(404);
-    } else {
-      response->setStatus(403);
-    }
+    response->setStatus(403); // File exists but couldn't read (permission issue)
     return;
   } else {
     if (this->endswith(path, ".css")) {
@@ -66,7 +73,6 @@ void FileService::get(HTTPRequest *request, HTTPResponse *response) {
 string FileService::readFile(string path) {
   int fd = open(path.c_str(), O_RDONLY);
   if (fd < 0) {
-    m_last_error = errno;
     return "";
   }
 
@@ -78,7 +84,6 @@ string FileService::readFile(string path) {
   }
 
   close(fd);
-  m_last_error = 0;
   return result;
 }
 

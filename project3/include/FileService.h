@@ -18,7 +18,6 @@ private:
   std::string readFile(std::string path);
 
   std::string m_basedir;
-  int m_last_error;
 };
 
 #endif
