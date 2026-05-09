@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
-#include <deque>
+#include <queue>
 
 #include "HTTPRequest.h"
 #include "HTTPResponse.h"
@@ -30,6 +30,11 @@ string SCHEDALG = "FIFO";
 string LOGFILE = "/dev/null";
 
 vector<HttpService *> services;
+
+queue<MySocket *> requestQueue;
+pthread_mutex_t queueLock = PTHREAD_MUTEX_INITIALIZER; //LOCK for threads
+pthread_cond_t qNotEmpty = PTHREAD_COND_INITIALIZER; //monitor condition for queue not empty
+pthread_cond_t qNotFull = PTHREAD_COND_INITIALIZER; //monitor condition for queue not full
 
 HttpService *find_service(HTTPRequest *request) {
    // find a service that is registered for this path prefix
@@ -104,6 +109,25 @@ void handle_request(MySocket *client) {
   delete client;
 }
 
+void *worker_thread(void *arg) {
+  while (true) {
+    MySocket *client;
+
+    // get a request from the queue
+    dthread_mutex_lock(&queueLock); // acquire lock
+    while (requestQueue.size() == 0) { // thread waits if queue empty
+      dthread_cond_wait(&qNotEmpty, &queueLock);
+    }
+    client = requestQueue.front(); // get client from front
+    requestQueue.pop(); // remove from queue
+    dthread_cond_signal(&qNotFull); // signal producer
+    dthread_mutex_unlock(&queueLock); // release lock
+
+    handle_request(client); // process request
+  }
+  return NULL;
+}
+
 int main(int argc, char *argv[]) {
 
   signal(SIGPIPE, SIG_IGN);
@@ -144,11 +168,28 @@ int main(int argc, char *argv[]) {
   // The order that you push services dictates the search order
   // for path prefix matching
   services.push_back(new FileService(BASEDIR));
+
+  // THREAD POOL
+  for (int i = 0; i < THREAD_POOL_SIZE; i++) {
+    pthread_t tid;
+    dthread_create(&tid, NULL, worker_thread, NULL);
+    dthread_detach(tid);
+  }
   
   while(true) {
     sync_print("waiting_to_accept", "");
     client = server->accept();
     sync_print("client_accepted", "");
-    handle_request(client);
+    
+    // producer-consumer connection between the buffers and main thread
+    dthread_mutex_lock(&queueLock); //LOCK for thread to access the queue
+    //critical section for queue access
+    while (requestQueue.size() >= (size_t)BUFFER_SIZE) { //if buffer is less than queue size, wait for signal where buffer is freed
+      dthread_cond_wait(&qNotFull, &queueLock);
+    }
+
+    requestQueue.push(client); //push thread connection to queue in buffer slot
+    dthread_cond_signal(&qNotEmpty); //signal next waiting thread
+    dthread_mutex_unlock(&queueLock); //then unlock
   }
 }
