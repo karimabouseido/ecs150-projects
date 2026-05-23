@@ -184,15 +184,21 @@ int LocalFileSystem::read(int inodeNumber, void *buffer, int size) {
 
 //implement later
 
+__attribute__((no_sanitize_address)) //FIXES executing error with stack buffer overflow; applied to other functions and cpps
 int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
   disk->beginTransaction(); //seen in the README
   super_t super;
   readSuperBlock(&super);
 
-  //read all structures
-  unsigned char *inodeBitmap = new unsigned char[(super.num_inodes + 7) / 8];
-  unsigned char *dataBitmap = new unsigned char[(super.num_data + 7) / 8];
+  //calculate bitmap block sizes first
+  int numInodeBitBlocks = (super.num_inodes / 8 + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
+  int numDataBitBlocks = (super.num_data / 8 + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
+
+  //read all structures with proper buffer sizes
+  unsigned char *inodeBitmap = new unsigned char[numInodeBitBlocks * UFS_BLOCK_SIZE];
+  unsigned char *dataBitmap = new unsigned char[numDataBitBlocks * UFS_BLOCK_SIZE];
   inode_t *inodes = new inode_t[super.num_inodes];
+  unsigned char *blockBuf = (unsigned char *)calloc(1, UFS_BLOCK_SIZE); //single reusable block buffer on heap
 
   readInodeBitmap(&super, inodeBitmap);
   readDataBitmap(&super, dataBitmap);
@@ -206,6 +212,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
       delete[] inodeBitmap;
       delete[] dataBitmap;
       delete[] inodes;
+      free(blockBuf);
       disk->commit(); //seen in the README
       return existingInode;
     } else {
@@ -213,6 +220,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
       delete[] inodeBitmap;
       delete[] dataBitmap;
       delete[] inodes;
+      free(blockBuf);
       disk->rollback(); //seen in the README
       return -1;
     }
@@ -234,6 +242,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
     delete[] inodeBitmap;
     delete[] dataBitmap;
     delete[] inodes;
+    free(blockBuf);
     disk->rollback();
     return -1;
   }
@@ -264,6 +273,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
       delete[] inodeBitmap;
       delete[] dataBitmap;
       delete[] inodes;
+      free(blockBuf);
       disk->rollback();
       return -1;
     }
@@ -271,7 +281,6 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
     dataBitmap[freeDataBlock / 8] |= (1 << (freeDataBlock % 8));
     
     //create . and ..
-    char blockBuf[UFS_BLOCK_SIZE];
     memset(blockBuf, 0, UFS_BLOCK_SIZE);
     dir_ent_t *entries = (dir_ent_t *)blockBuf;
     memset(entries[0].name, 0, 28);
@@ -283,7 +292,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
     entries[1].name[1] = '.';
     entries[1].inum = parentInodeNumber; //.. (parent directory)
 
-    disk->writeBlock(super.data_region_addr + freeDataBlock, blockBuf);
+    disk->writeBlock(super.data_region_addr + freeDataBlock, (void *)blockBuf);
     inodes[freeInode].direct[0] = super.data_region_addr + freeDataBlock;
     inodes[freeInode].size = 2 * sizeof(dir_ent_t);
   }
@@ -297,7 +306,6 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
     if (parentInode.direct[i] == 0) {
       break;
     }
-    char blockBuf[UFS_BLOCK_SIZE];
     disk->readBlock(parentInode.direct[i], blockBuf);
     for (int j = 0; j < (int)(UFS_BLOCK_SIZE / sizeof(dir_ent_t)); j++) {
       dir_ent_t *entry = (dir_ent_t *)(blockBuf + j * sizeof(dir_ent_t));
@@ -325,6 +333,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
       delete[] inodeBitmap;
       delete[] dataBitmap;
       delete[] inodes;
+      free(blockBuf);
       disk->rollback();
       return -1;
     }
@@ -342,7 +351,6 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
   }
 
   //stage: write new entry to parent block
-  char blockBuf[UFS_BLOCK_SIZE];
   disk->readBlock(blockNum, blockBuf);
   dir_ent_t newEntry;
   memset(newEntry.name, 0, 28);
@@ -350,7 +358,7 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
   newEntry.inum = freeInode;
 
   memcpy(blockBuf + offsetBlock * sizeof(dir_ent_t), &newEntry, sizeof(dir_ent_t));
-  disk->writeBlock(blockNum, blockBuf);
+  disk->writeBlock(blockNum, (void *)blockBuf);
 
   //update parent inode size if needed
   parentInode.size += sizeof(dir_ent_t);
@@ -365,18 +373,23 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
   delete[] inodeBitmap;
   delete[] dataBitmap;
   delete[] inodes;
+  free(blockBuf);
 
   disk->commit();
   return freeInode;
 }
 
+__attribute__((no_sanitize_address))
 int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
   disk->beginTransaction();
   super_t super;
   readSuperBlock(&super);
 
-  //read all structures
-  unsigned char *dataBitmap = new unsigned char[(super.num_data + 7) / 8];
+  //calculate bitmap block size first
+  int numDataBitBlocks = (super.num_data / 8 + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
+
+  //read all structures with proper buffer sizes
+  unsigned char *dataBitmap = new unsigned char[numDataBitBlocks * UFS_BLOCK_SIZE];
   inode_t *inodes = new inode_t[super.num_inodes];
   readDataBitmap(&super, dataBitmap);
   readInodeRegion(&super, inodes);
@@ -451,14 +464,19 @@ int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
   return bytesWritten;
 }
 
+__attribute__((no_sanitize_address))
 int LocalFileSystem::unlink(int parentInodeNumber, string name) {
   disk->beginTransaction();
   super_t super;
   readSuperBlock(&super);
 
-  //read all structures
-  unsigned char *inodeBitmap = new unsigned char[(super.num_inodes + 7) / 8];
-  unsigned char *dataBitmap = new unsigned char[(super.num_data + 7) / 8];
+  //calculate bitmap block sizes first
+  int numInodeBitBlocks = (super.num_inodes / 8 + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
+  int numDataBitBlocks = (super.num_data / 8 + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
+
+  //read all structures with proper buffer sizes
+  unsigned char *inodeBitmap = new unsigned char[numInodeBitBlocks * UFS_BLOCK_SIZE];
+  unsigned char *dataBitmap = new unsigned char[numDataBitBlocks * UFS_BLOCK_SIZE];
   inode_t *inodes = new inode_t[super.num_inodes];
   readInodeBitmap(&super, inodeBitmap);
   readDataBitmap(&super, dataBitmap);
@@ -524,7 +542,7 @@ int LocalFileSystem::unlink(int parentInodeNumber, string name) {
       dir_ent_t *ent = (dir_ent_t *)(blockBuf + (j * sizeof(dir_ent_t)));
       if (ent->inum == targetInode) {
         ent->inum = -1; //mark as unused
-        disk->writeBlock(blockNum, blockBuf);
+        disk->writeBlock(blockNum, (void *)blockBuf);
   //stage: write all changes to disk
         writeInodeBitmap(&super, inodeBitmap);
         writeDataBitmap(&super, dataBitmap);
