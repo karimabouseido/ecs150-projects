@@ -122,7 +122,10 @@ int LocalFileSystem::lookup(int parentInodeNumber, string name) { //lookup will 
       
       if (dirEntry.inum == -1) continue;  //unused entry
       
-      if (string(dirEntry.name) == name) {
+      char safeName[DIR_ENT_NAME_SIZE + 1];
+      memcpy(safeName, dirEntry.name, DIR_ENT_NAME_SIZE);
+      safeName[DIR_ENT_NAME_SIZE] = '\0';
+      if (string(safeName) == name) {
         delete[] inodes;
         return dirEntry.inum;
       }
@@ -204,6 +207,46 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
   readDataBitmap(&super, dataBitmap);
   readInodeRegion(&super, inodes);
 
+  //validate parent inode number range
+  if (parentInodeNumber < 0 || parentInodeNumber >= super.num_inodes) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    free(blockBuf);
+    disk->rollback();
+    return -EINVALIDINODE;
+  }
+
+  //validate parent inode is allocated
+  if (!(inodeBitmap[parentInodeNumber / 8] & (1 << (parentInodeNumber % 8)))) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    free(blockBuf);
+    disk->rollback();
+    return -EINVALIDINODE;
+  }
+
+  //validate parent is a directory
+  if (inodes[parentInodeNumber].type != UFS_DIRECTORY) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    free(blockBuf);
+    disk->rollback();
+    return -EINVALIDTYPE;
+  }
+
+  //validate name length (must fit within DIR_ENT_NAME_SIZE including null terminator)
+  if (name.length() > DIR_ENT_NAME_SIZE - 1) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    free(blockBuf);
+    disk->rollback();
+    return -EINVALIDNAME;
+  }
+
   //stage: check if entry already exists
   int existingInode = lookup(parentInodeNumber, name);
   if (existingInode >= 0) {
@@ -283,6 +326,10 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
     //create . and ..
     memset(blockBuf, 0, UFS_BLOCK_SIZE);
     dir_ent_t *entries = (dir_ent_t *)blockBuf;
+    //initialize all entries to -1 (free) so scans using inum==-1 work correctly
+    for (int j = 0; j < (int)(UFS_BLOCK_SIZE / sizeof(dir_ent_t)); j++) {
+      entries[j].inum = -1;
+    }
     memset(entries[0].name, 0, 28);
     entries[0].name[0] = '.'; //. (current directory)
     entries[0].inum = freeInode;
@@ -367,7 +414,10 @@ int LocalFileSystem::create(int parentInodeNumber, int type, string name) {
   writeInodeBitmap(&super, inodeBitmap);
   writeDataBitmap(&super, dataBitmap);
   writeInodeRegion(&super, inodes);
-  disk->writeBlock(0, &super); //write superblock back in case we need to update any info there
+  unsigned char *superBuf = (unsigned char *)calloc(1, UFS_BLOCK_SIZE);
+  memcpy(superBuf, &super, sizeof(super_t));
+  disk->writeBlock(0, superBuf);
+  free(superBuf);
 
   //cleanup
   delete[] inodeBitmap;
@@ -385,6 +435,16 @@ int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
   super_t super;
   readSuperBlock(&super);
 
+  if (inodeNumber < 0 || inodeNumber >= super.num_inodes) {
+    disk->rollback();
+    return -EINVALIDINODE;
+  }
+
+  if (size < 0) {
+    disk->rollback();
+    return -EINVALIDSIZE;
+  }
+
   //calculate bitmap block size first
   int numDataBitBlocks = (super.num_data / 8 + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
 
@@ -394,6 +454,13 @@ int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
   readDataBitmap(&super, dataBitmap);
   readInodeRegion(&super, inodes);
 
+  if (inodes[inodeNumber].type == UFS_DIRECTORY) {
+    delete[] dataBitmap;
+    delete[] inodes;
+    disk->rollback();
+    return -EINVALIDTYPE;
+  }
+
   inode_t &fileInode = inodes[inodeNumber];
   //CALCULATE how many blocks needed for this file
   int blocksNeeded = (size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
@@ -402,8 +469,10 @@ int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
   int bytesWritten = 0;
   //reuse existing blocks if possible as first priority
   for (int i = 0; i < blocksNeeded && i < DIRECT_PTRS; i++) {
-    int blockNum = fileInode.direct[i];
-    
+    // Only reuse direct[i] if it was a properly allocated block (i < blocksHad).
+    // Beyond blocksHad the slot may contain garbage from uninitialized disk space.
+    int blockNum = (i < blocksHad) ? (int)fileInode.direct[i] : 0;
+
     //allocate if needed
     if (blockNum == 0) {
       int newBlock = -1;
@@ -434,9 +503,12 @@ int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
       fileInode.direct[i] = blockNum;
     }
     
-    // Write data to block
+    // Copy into a full-block buffer so writeBlock always gets exactly 4096 bytes
     int bytesToWrite = min(UFS_BLOCK_SIZE, size - bytesWritten);
-    disk->writeBlock(blockNum, (char *)buffer + bytesWritten);
+    char tempBlock[UFS_BLOCK_SIZE];
+    memset(tempBlock, 0, UFS_BLOCK_SIZE);
+    memcpy(tempBlock, (char *)buffer + bytesWritten, bytesToWrite);
+    disk->writeBlock(blockNum, tempBlock);
     bytesWritten += bytesToWrite;
   }
 
@@ -454,7 +526,10 @@ int LocalFileSystem::write(int inodeNumber, const void *buffer, int size) {
   fileInode.size = bytesWritten;
   writeDataBitmap(&super, dataBitmap);
   writeInodeRegion(&super, inodes);
-  disk->writeBlock(0, (void *)&super);
+  unsigned char *superBuf = (unsigned char *)calloc(1, UFS_BLOCK_SIZE);
+  memcpy(superBuf, &super, sizeof(super_t));
+  disk->writeBlock(0, superBuf);
+  free(superBuf);
 
   //cleanup
   delete[] dataBitmap;
@@ -482,15 +557,31 @@ int LocalFileSystem::unlink(int parentInodeNumber, string name) {
   readDataBitmap(&super, dataBitmap);
   readInodeRegion(&super, inodes);
 
-  //stage: find entry in parent directory
-  int targetInode = lookup(parentInodeNumber, name);
-  if (targetInode < 0) {
-    //entry doesn't exist, return error
+  //validate parent inode range
+  if (parentInodeNumber < 0 || parentInodeNumber >= super.num_inodes) {
     delete[] inodeBitmap;
     delete[] dataBitmap;
     delete[] inodes;
     disk->rollback();
-    return -1;
+    return -EINVALIDINODE;
+  }
+
+  //validate parent is allocated
+  if (!(inodeBitmap[parentInodeNumber / 8] & (1 << (parentInodeNumber % 8)))) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    disk->rollback();
+    return -EINVALIDINODE;
+  }
+
+  //validate parent is a directory
+  if (inodes[parentInodeNumber].type != UFS_DIRECTORY) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    disk->rollback();
+    return -EINVALIDINODE;
   }
 
   //stage: reject unlinking . or ..
@@ -499,28 +590,51 @@ int LocalFileSystem::unlink(int parentInodeNumber, string name) {
     delete[] dataBitmap;
     delete[] inodes;
     disk->rollback();
-    return -1;
+    return -EUNLINKNOTALLOWED;
+  }
+
+  //stage: find entry in parent directory — name not existing is NOT a failure
+  int targetInode = lookup(parentInodeNumber, name);
+  if (targetInode < 0) {
+    delete[] inodeBitmap;
+    delete[] dataBitmap;
+    delete[] inodes;
+    disk->commit();
+    return 0;
   }
 
   inode_t &target = inodes[targetInode];
-  //stage: if directory, check if empty (only . and ..)
+  //stage: if directory, count actual valid entries (not just check size)
   if (target.type == UFS_DIRECTORY) {
-    if (target.size != 2 * sizeof(dir_ent_t)) {
+    int validEntries = 0;
+    for (int i = 0; i < DIRECT_PTRS; i++) {
+      int blk = (int)target.direct[i];
+      if (blk == 0 || blk == -1) break;
+      char blkBuf[UFS_BLOCK_SIZE];
+      disk->readBlock(blk, blkBuf);
+      int cnt = UFS_BLOCK_SIZE / sizeof(dir_ent_t);
+      for (int j = 0; j < cnt; j++) {
+        dir_ent_t *ent = (dir_ent_t *)(blkBuf + j * sizeof(dir_ent_t));
+        if (ent->inum != -1) validEntries++;
+      }
+    }
+    if (validEntries > 2) {
       delete[] inodeBitmap;
       delete[] dataBitmap;
       delete[] inodes;
       disk->rollback();
-      return -1; // Directory not empty
+      return -EDIRNOTEMPTY;
     }
   }
 
   //stage: free all data blocks used by file/directory
-  for (int i = 0; i < DIRECT_PTRS; i++) {
+  int targetBlocksHad = (target.size + UFS_BLOCK_SIZE - 1) / UFS_BLOCK_SIZE;
+  for (int i = 0; i < targetBlocksHad && i < DIRECT_PTRS; i++) {
     if (target.direct[i] != 0) {
-      int dataBlockIdx = target.direct[i] - super.data_region_addr;
-      dataBitmap[dataBlockIdx / 8] &= ~(1 << (dataBlockIdx % 8)); //mark block as free
-    } else {
-      break;
+      int dataBlockIdx = (int)target.direct[i] - super.data_region_addr;
+      if (dataBlockIdx >= 0 && dataBlockIdx < super.num_data) {
+        dataBitmap[dataBlockIdx / 8] &= ~(1 << (dataBlockIdx % 8));
+      }
     }
   }
 
@@ -547,10 +661,10 @@ int LocalFileSystem::unlink(int parentInodeNumber, string name) {
         writeInodeBitmap(&super, inodeBitmap);
         writeDataBitmap(&super, dataBitmap);
         writeInodeRegion(&super, inodes);
-        disk->writeBlock(0, (void *)&super);
-        
-        delete[] inodeBitmap;
-        delete[] dataBitmap;
+    unsigned char *superBuf = (unsigned char *)calloc(1, UFS_BLOCK_SIZE);
+    memcpy(superBuf, &super, sizeof(super_t));
+    disk->writeBlock(0, superBuf);
+    free(superBuf);
         delete[] inodes;
         
         disk->commit();

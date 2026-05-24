@@ -31,7 +31,7 @@ int main(int argc, char *argv[]) {
   //read source file from host filesystem
   int fd = open(srcFile.c_str(), O_RDONLY);
   if (fd < 0) {
-    cerr << "Error opening source file" << endl;
+    cerr << "Could not write to dst_file" << endl;
     delete fileSystem;
     delete disk;
     return 1;
@@ -55,24 +55,10 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  //extract filename from srcFile path
-  size_t lastSlash = srcFile.rfind('/');
-  string fileName = (lastSlash != string::npos) ? srcFile.substr(lastSlash + 1) : srcFile;
-
-  //create file in disk
-  int newInode = fileSystem->create(dstInode, UFS_REGULAR_FILE, fileName);
-  if (newInode < 0) {
-    cerr << "Error creating file" << endl;
-    delete[] fileBuffer;
-    delete fileSystem;
-    delete disk;
-    return 1;
-  }
-
-  //write file contents
-  int bytesWritten = fileSystem->write(newInode, fileBuffer, fileSize);
+  // write file contents directly to the destination inode
+  int bytesWritten = fileSystem->write(dstInode, fileBuffer, (int)fileSize);
   if (bytesWritten < 0) {
-    cerr << "Error writing to file" << endl;
+    cerr << "Could not write to dst_file" << endl;
     delete[] fileBuffer;
     delete fileSystem;
     delete disk;
